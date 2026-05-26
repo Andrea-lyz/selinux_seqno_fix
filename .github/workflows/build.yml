@@ -267,9 +267,9 @@ jobs:
           cp modinfo.txt kernelrelease.txt "$ARTIFACT_DIR/"
           if [[ "${KBUILD_MODPOST_WARN:-0}" == "1" ]]; then
             cat > "$ARTIFACT_DIR/MODPOST_WARN.txt" <<'EOF'
-KBUILD_MODPOST_WARN=1 was used because the kernel tree did not provide Module.symvers.
-This .ko may fail to load on kernels that enforce CONFIG_MODVERSIONS.
-EOF
+          KBUILD_MODPOST_WARN=1 was used because the kernel tree did not provide Module.symvers.
+          This .ko may fail to load on kernels that enforce CONFIG_MODVERSIONS.
+          EOF
           fi
           sha256sum "$ARTIFACT_DIR/${MODULE_NAME}.ko" | tee "$ARTIFACT_DIR/${MODULE_NAME}.ko.sha256"
 
