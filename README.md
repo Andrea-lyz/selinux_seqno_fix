@@ -51,10 +51,11 @@ Run **Build selinux_seqno_fix.ko** from the Actions tab. The artifact contains
 the raw `.ko` and a flashable KSU/Magisk-style zip that loads it from
 `service.sh`.
 
-The workflow defaults to the fast path: `gki_defconfig`, `modules_prepare`, and
-then the external module build. Enable `full_kernel_build` only if the resulting
-`.ko` refuses to load because the target kernel requires fresh symbol version
-data from a full `Image` build.
+The workflow tries the fast path first: `gki_defconfig`, `modules_prepare`, and
+then the external module build. If `out/Module.symvers` is missing, it
+automatically builds `Image` once to generate the kernel symbol versions required
+by modpost. Enable `full_kernel_build` only when you want to force that slow path
+from the start.
 
 The module must be built for the exact kernel release running on the phone.
 If `uname -r` differs, rerun the workflow with a matching `kernel_suffix` and

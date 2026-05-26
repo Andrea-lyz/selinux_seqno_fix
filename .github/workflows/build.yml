@@ -129,12 +129,24 @@ jobs:
           export PATH="${GITHUB_WORKSPACE}/kernel_workspace/clang18/bin:${GITHUB_WORKSPACE}/kernel_workspace/build-tools/bin:${PATH}"
           cd kernel_workspace/common
 
-          if [[ "$FULL_KERNEL_BUILD" == "true" ]]; then
-            make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+          build_image_for_symvers() {
+            local log="${GITHUB_WORKSPACE}/kernel-image.log"
+            echo "::group::Build kernel Image for Module.symvers"
+            if ! make -j"$(nproc)" LLVM=1 ARCH=arm64 \
               CROSS_COMPILE=aarch64-linux-gnu- \
               CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
               KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
-              Image
+              Image >"$log" 2>&1; then
+              tail -n 300 "$log" || true
+              echo "::endgroup::"
+              exit 1
+            fi
+            tail -n 80 "$log" || true
+            echo "::endgroup::"
+          }
+
+          if [[ "$FULL_KERNEL_BUILD" == "true" ]]; then
+            build_image_for_symvers
           fi
 
           make -j"$(nproc)" LLVM=1 ARCH=arm64 \
@@ -145,7 +157,18 @@ jobs:
 
           make -s LLVM=1 ARCH=arm64 O=out kernelrelease | tee "${GITHUB_WORKSPACE}/kernelrelease.txt"
           if [[ ! -s out/Module.symvers ]]; then
-            echo "::warning::out/Module.symvers is missing or empty; the module may only load on kernels without modversion requirements."
+            echo "::warning::out/Module.symvers is missing after modules_prepare; building Image once to generate kernel symbol versions."
+            build_image_for_symvers
+            make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+              KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
+              modules_prepare
+          fi
+
+          if [[ ! -s out/Module.symvers ]]; then
+            echo "::error::out/Module.symvers is still missing after Image build; cannot produce a reliable loadable .ko for this kernel."
+            exit 1
           fi
 
       - name: Build external module

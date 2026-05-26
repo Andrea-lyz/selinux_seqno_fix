@@ -4,6 +4,8 @@
  * SELinux status page. This intentionally does not change the access decision.
  */
 
+#define pr_fmt(fmt) "selinux_seqno_fix: " fmt
+
 #include <linux/compiler.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -12,8 +14,6 @@
 #include <linux/module.h>
 #include <linux/ptrace.h>
 #include <linux/types.h>
-
-#define pr_fmt(fmt) "selinux_seqno_fix: " fmt
 
 struct av_decision_compat {
 	u32 allowed;
