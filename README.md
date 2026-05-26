@@ -67,12 +67,23 @@ If `uname -r` differs, rerun the workflow with a matching `kernel_suffix` and
 kernel branch.
 The KSU service script writes load diagnostics to `load.log` in the module
 directory.
+The module also exposes diagnostic counters under
+`/sys/module/selinux_seqno_fix/parameters/`.
 
 ## Load
 
 ```sh
 su -c 'insmod /data/local/tmp/selinux_seqno_fix.ko'
 su -c 'dmesg | grep selinux_seqno_fix'
+```
+
+After loading, confirm that the kretprobe is seeing SELinux userspace access
+queries:
+
+```sh
+su -c 'cat /sys/module/selinux_seqno_fix/parameters/hits'
+su -c 'cat /sys/module/selinux_seqno_fix/parameters/fixups'
+su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_live_seqno'
 ```
 
 Disable without unloading:

@@ -40,9 +40,32 @@ struct seqno_fix_data {
 static struct selinux_kernel_status_compat *status_page_addr;
 static u32 cached_policyload;
 static bool enabled = true;
+static unsigned long av_user_hits;
+static unsigned long av_user_fixups;
+static unsigned long av_user_no_policyload;
+static unsigned long av_user_null_avd;
+static unsigned int last_old_seqno;
+static unsigned int last_live_seqno;
 
 module_param(enabled, bool, 0644);
 MODULE_PARM_DESC(enabled, "Enable seqno fixups for security_compute_av_user results");
+module_param_named(hits, av_user_hits, ulong, 0444);
+MODULE_PARM_DESC(hits, "Number of security_compute_av_user returns observed");
+module_param_named(fixups, av_user_fixups, ulong, 0444);
+MODULE_PARM_DESC(fixups, "Number of av_decision seqno values rewritten");
+module_param_named(no_policyload, av_user_no_policyload, ulong, 0444);
+MODULE_PARM_DESC(no_policyload, "Number of returns skipped because live policyload was unavailable");
+module_param_named(null_avd, av_user_null_avd, ulong, 0444);
+MODULE_PARM_DESC(null_avd, "Number of returns skipped because the av_decision pointer was missing");
+module_param_named(last_old_seqno, last_old_seqno, uint, 0444);
+MODULE_PARM_DESC(last_old_seqno, "Last av_decision seqno observed before fixup");
+module_param_named(last_live_seqno, last_live_seqno, uint, 0444);
+MODULE_PARM_DESC(last_live_seqno, "Last live SELinux status policyload observed");
+
+static void bump_counter(unsigned long *counter)
+{
+	WRITE_ONCE(*counter, READ_ONCE(*counter) + 1);
+}
 
 static void *resolve_symbol_with_kprobe(const char *name)
 {
@@ -107,6 +130,7 @@ static int seqno_fix_entry_handler(struct kretprobe_instance *ri,
 	struct seqno_fix_data *data = (struct seqno_fix_data *)ri->data;
 
 #if defined(CONFIG_ARM64)
+	/* security_compute_av_user(..., avd) passes avd as the fourth argument. */
 	data->avd = (struct av_decision_compat *)regs->regs[3];
 #else
 	data->avd = NULL;
@@ -123,15 +147,27 @@ static int seqno_fix_return_handler(struct kretprobe_instance *ri,
 	u32 live_seqno;
 	u32 old_seqno;
 
-	if (!enabled || !avd)
+	if (!enabled)
 		return 0;
 
-	if (!read_live_policyload(&live_seqno))
+	bump_counter(&av_user_hits);
+
+	if (!avd) {
+		bump_counter(&av_user_null_avd);
 		return 0;
+	}
+
+	if (!read_live_policyload(&live_seqno)) {
+		bump_counter(&av_user_no_policyload);
+		return 0;
+	}
 
 	old_seqno = READ_ONCE(avd->seqno);
+	WRITE_ONCE(last_old_seqno, old_seqno);
+	WRITE_ONCE(last_live_seqno, live_seqno);
 	if (old_seqno != live_seqno) {
 		WRITE_ONCE(avd->seqno, live_seqno);
+		bump_counter(&av_user_fixups);
 		pr_debug("fixed avd seqno %u -> %u\n", old_seqno, live_seqno);
 	}
 
