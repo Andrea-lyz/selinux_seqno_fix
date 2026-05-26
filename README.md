@@ -1,5 +1,15 @@
 # selinux_seqno_fix
 
+> **Status: temporary stop-gap.** This module exists only because current
+> KernelSU builds expose a `status.policyload == 0` vs `access.avd.seqno > 0`
+> split through `apply_kernelsu_rules() -> selinux_status_update_policyload(0)`.
+> Once that bug is fixed upstream — most likely by simply dropping the
+> `selinux_status_update_policyload(0)` call in `kernel/selinux/rules.c`, since
+> KSU's hidden rules patch `avd.allowed` directly and don't actually need to
+> invalidate userspace SELinux status caches — this module becomes a historical
+> artifact and should be unloaded. Track KernelSU upstream and stop using this
+> the day a release lands that no longer produces the split.
+
 Tiny Android kernel module for the SELinux `/sys/fs/selinux/status` and
 `/sys/fs/selinux/access` seqno split exposed by KernelSU policy hiding.
 
@@ -145,3 +155,23 @@ su -c 'rmmod selinux_seqno_fix'
   registered, the module continues with the `security_compute_av_user`-only
   safety-net path. If `selinux_kernel_status_page()` cannot be resolved at
   all, the module refuses to load rather than guessing structure offsets.
+
+## Lifetime / when to retire this module
+
+This module is a workaround for a single, well-localized KernelSU side effect.
+It is expected to be obsoleted upstream. The cleanest fix is in KernelSU
+itself: drop `selinux_status_update_policyload(0)` from `apply_kernelsu_rules()`
+in `kernel/selinux/rules.c`. KSU's hook rules patch `avd.allowed` directly, so
+nothing needs to invalidate the userspace SELinux status page; the call is
+collateral damage left over from an earlier design.
+
+When that lands upstream:
+
+1. The split goes away on its own — `status.policyload` no longer gets stomped.
+2. The Duck Detector / `ksu-edge-seqno-demo` policyload/avd.seqno oracle returns
+   to `clean` without any kernel module.
+3. This repo should be archived. Keep the tag/release as a historical record
+   of the side effect and stop using `insmod selinux_seqno_fix.ko`.
+
+Until then, treat this module as a short-lived patch, not a long-term
+component. No new detectors or features should be built around it.
