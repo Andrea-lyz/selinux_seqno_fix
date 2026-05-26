@@ -53,9 +53,9 @@ the raw `.ko` and a flashable KSU/Magisk-style zip that loads it from
 
 The workflow tries the fast path first: `gki_defconfig`, `modules_prepare`, and
 then the external module build. If `out/Module.symvers` is missing, it
-automatically builds `Image` once to generate the kernel symbol versions required
-by modpost. Enable `full_kernel_build` only when you want to force that slow path
-from the start.
+automatically builds in-tree `modules` once to generate the kernel symbol
+versions required by modpost. Enable `full_kernel_build` only when you want to
+force that slow path from the start.
 
 CI uses GitHub cache for downloaded archives, the unpacked kernel/toolchain, and
 `kernel_workspace/out`. The first run for a kernel branch/suffix is still

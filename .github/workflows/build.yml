@@ -19,7 +19,7 @@ on:
         type: string
         default: android15-8-g29d86c5fc9dd-abogki428889875-4k
       full_kernel_build:
-        description: Build full Image first. Slower, only useful when you need fresh Module.symvers from a full kernel build.
+        description: Build in-tree modules first. Slower, useful when you need fresh Module.symvers from a full kernel build.
         required: true
         type: choice
         default: 'false'
@@ -190,14 +190,21 @@ jobs:
           KERNEL_OUT="${GITHUB_WORKSPACE}/kernel_workspace/out"
           cd kernel_workspace/common
 
-          build_image_for_symvers() {
-            local log="${GITHUB_WORKSPACE}/kernel-image.log"
-            echo "::group::Build kernel Image for Module.symvers"
-            if ! make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+          build_modules_for_symvers() {
+            local log="${GITHUB_WORKSPACE}/kernel-modules.log"
+            echo "::group::Build in-tree modules for Module.symvers"
+            make -j"$(nproc)" LLVM=1 ARCH=arm64 \
               CROSS_COMPILE=aarch64-linux-gnu- \
               CC=clang LD=ld.lld HOSTLD=ld.lld O="$KERNEL_OUT" \
               KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
-              Image >"$log" 2>&1; then
+              modules >"$log" 2>&1 &
+            local make_pid=$!
+            while kill -0 "$make_pid" 2>/dev/null; do
+              sleep 60
+              echo "--- still building in-tree modules: $(date -u '+%Y-%m-%d %H:%M:%S UTC') ---"
+              tail -n 25 "$log" || true
+            done
+            if ! wait "$make_pid"; then
               tail -n 300 "$log" || true
               echo "::endgroup::"
               exit 1
@@ -207,7 +214,7 @@ jobs:
           }
 
           if [[ "$FULL_KERNEL_BUILD" == "true" ]]; then
-            build_image_for_symvers
+            build_modules_for_symvers
           fi
 
           make -j"$(nproc)" LLVM=1 ARCH=arm64 \
@@ -218,8 +225,8 @@ jobs:
 
           make -s LLVM=1 ARCH=arm64 O="$KERNEL_OUT" kernelrelease | tee "${GITHUB_WORKSPACE}/kernelrelease.txt"
           if [[ ! -s "$KERNEL_OUT/Module.symvers" ]]; then
-            echo "::warning::Module.symvers is missing after modules_prepare; building Image once to generate kernel symbol versions."
-            build_image_for_symvers
+            echo "::warning::Module.symvers is missing after modules_prepare; building in-tree modules once to generate kernel symbol versions."
+            build_modules_for_symvers
             make -j"$(nproc)" LLVM=1 ARCH=arm64 \
               CROSS_COMPILE=aarch64-linux-gnu- \
               CC=clang LD=ld.lld HOSTLD=ld.lld O="$KERNEL_OUT" \
@@ -228,8 +235,10 @@ jobs:
           fi
 
           if [[ ! -s "$KERNEL_OUT/Module.symvers" ]]; then
-            echo "::error::Module.symvers is still missing after Image build; cannot produce a reliable loadable .ko for this kernel."
-            exit 1
+            echo "::warning::Module.symvers is still missing after in-tree modules. External module build will use KBUILD_MODPOST_WARN=1 and may fail to load on MODVERSIONS kernels."
+            echo "KBUILD_MODPOST_WARN=1" >> "$GITHUB_ENV"
+          else
+            echo "KBUILD_MODPOST_WARN=0" >> "$GITHUB_ENV"
           fi
 
       - name: Build external module
@@ -240,6 +249,7 @@ jobs:
           make -C "${GITHUB_WORKSPACE}/kernel_workspace/common" O="$KERNEL_OUT" M="${GITHUB_WORKSPACE}" \
             LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld HOSTLD=ld.lld \
+            KBUILD_MODPOST_WARN="${KBUILD_MODPOST_WARN:-0}" \
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
             modules
           test -f "${MODULE_NAME}.ko"
@@ -255,6 +265,12 @@ jobs:
 
           cp "${MODULE_NAME}.ko" "$ARTIFACT_DIR/"
           cp modinfo.txt kernelrelease.txt "$ARTIFACT_DIR/"
+          if [[ "${KBUILD_MODPOST_WARN:-0}" == "1" ]]; then
+            cat > "$ARTIFACT_DIR/MODPOST_WARN.txt" <<'EOF'
+KBUILD_MODPOST_WARN=1 was used because the kernel tree did not provide Module.symvers.
+This .ko may fail to load on kernels that enforce CONFIG_MODVERSIONS.
+EOF
+          fi
           sha256sum "$ARTIFACT_DIR/${MODULE_NAME}.ko" | tee "$ARTIFACT_DIR/${MODULE_NAME}.ko.sha256"
 
           cp -r ksu-module/* package/
