@@ -1,19 +1,22 @@
 # selinux_seqno_fix
 
-Tiny Android kernel module for the SELinux `/sys/fs/selinux/access` seqno split.
+Tiny Android kernel module for the SELinux `/sys/fs/selinux/status` and
+`/sys/fs/selinux/access` seqno split.
 
-The module only hooks `security_compute_av_user()` and rewrites the returned
-`av_decision.seqno` to the live SELinux status `policyload` value. It does not
-change `allowed`, `auditallow`, `auditdeny`, or `flags`.
+The module hooks `security_compute_av_user()` and aligns the SELinux status
+page `policyload` value to the returned `av_decision.seqno`. It does not change
+`allowed`, `auditallow`, `auditdeny`, or `flags`.
 
 ## Why
 
-Some SELinux hide implementations compute userspace access queries against a
-backup policy. If that whole `av_decision` is returned, `/sys/fs/selinux/access`
-can expose the backup policy `seqno`, while `/sys/fs/selinux/status` exposes the
-live policy `policyload`. Detectors can compare the two and report a seqno split.
+KernelSU-style SELinux hiding can call `selinux_status_update_policyload(0)`
+after applying policy rules. That leaves `/sys/fs/selinux/status` with a
+nonzero sequence but zero `policyload`, while `/sys/fs/selinux/access` still
+returns a positive `av_decision.seqno`. Detectors can compare the two and report
+a seqno split.
 
-This module makes the metadata consistent by keeping the live policy seqno.
+This module makes the metadata consistent by restoring status `policyload` to
+the observed access decision seqno.
 
 ## Build
 
@@ -83,7 +86,9 @@ queries:
 ```sh
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/hits'
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/fixups'
-su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_live_seqno'
+su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_status_policyload'
+su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_avc_policy_seqno'
+su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_avd_seqno'
 ```
 
 Disable without unloading:
@@ -102,7 +107,9 @@ su -c 'rmmod selinux_seqno_fix'
 
 - Requires `CONFIG_KPROBES` and `CONFIG_KRETPROBES`.
 - Resolves `selinux_kernel_status_page()` with a temporary kprobe at load time,
-  then only reads the mapped status page from the return handler.
+  then updates the mapped status page from the return handler.
+- Resolves `avc_policy_seqno()` when available so the initial status repair can
+  use the live AVC seqno before the first `/access` probe returns.
 - Designed for arm64 Android kernels.
 - If symbol resolution fails, the module refuses to load rather than guessing
   structure offsets.

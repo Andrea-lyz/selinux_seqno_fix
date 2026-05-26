@@ -10,7 +10,7 @@ log_msg() {
 }
 
 log_params() {
-  for name in enabled hits fixups no_policyload null_avd last_old_seqno last_live_seqno; do
+  for name in enabled hits fixups status_fixups no_status null_avd last_status_sequence last_status_policyload last_avc_policy_seqno last_avd_seqno last_old_seqno last_live_seqno; do
     path="/sys/module/selinux_seqno_fix/parameters/$name"
     if [ -r "$path" ]; then
       log_msg "$name=$(cat "$path" 2>/dev/null)"
