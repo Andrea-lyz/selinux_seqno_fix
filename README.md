@@ -9,6 +9,18 @@
 > invalidate userspace SELinux status caches — this module becomes a historical
 > artifact and should be unloaded. Track KernelSU upstream and stop using this
 > the day a release lands that no longer produces the split.
+>
+> **Detector-oriented engineering.** This project is written against the
+> detection surface — specifically the
+> [Duck Detector](https://github.com/eltavine/Duck-Detector-Refactoring)
+> policyload/avd.seqno oracle and the
+> [ksu-edge-seqno-demo](https://github.com/AAndreaLyz/ksu-edge-seqno-demo)
+> PoC. It does not add any new capabilities to KernelSU, does not weaken
+> SELinux enforcement, and does not alter access decisions. It only restores
+> metadata that KSU's own code incorrectly zeroes, making the kernel's
+> observable state consistent with what AOSP would produce without KSU
+> installed. If you're looking for a "cheat" — this isn't one; it's a
+> correctness patch for a metadata side-channel leak.
 
 Tiny Android kernel module for the SELinux `/sys/fs/selinux/status` and
 `/sys/fs/selinux/access` seqno split exposed by KernelSU policy hiding.
