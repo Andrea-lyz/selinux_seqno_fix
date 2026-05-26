@@ -1,6 +1,6 @@
 id=selinux_seqno_fix
 name=SELinux Seqno Fix
-version=v0.2
-versionCode=2
+version=v0.3
+versionCode=3
 author=Andrea-Lyz
-description=Load selinux_seqno_fix.ko to keep SELinux /access seqno metadata aligned with /status policyload.
+description=Restore SELinux /sys/fs/selinux/status policyload to the live AVC seqno via a seqlock-style write whenever KernelSU stomps it to 0.

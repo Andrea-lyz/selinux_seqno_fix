@@ -30,6 +30,7 @@ on:
     branches:
       - main
     paths:
+      - Kbuild
       - Makefile
       - selinux_seqno_fix.c
       - README.md
@@ -95,7 +96,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: kernel_workspace/out
-          key: kernel-out-${{ steps.vars.outputs.kernel_key }}-clang18-r510928-v2-${{ hashFiles('selinux_seqno_fix.c', 'Makefile') }}
+          key: kernel-out-${{ steps.vars.outputs.kernel_key }}-clang18-r510928-v2-${{ hashFiles('Kbuild', 'selinux_seqno_fix.c', 'Makefile') }}
           restore-keys: |
             kernel-out-${{ steps.vars.outputs.kernel_key }}-clang18-r510928-v2-
 
@@ -251,14 +252,27 @@ jobs:
           set -euxo pipefail
           export PATH="${GITHUB_WORKSPACE}/kernel_workspace/clang18/bin:${GITHUB_WORKSPACE}/kernel_workspace/build-tools/bin:${PATH}"
           KERNEL_OUT="${GITHUB_WORKSPACE}/kernel_workspace/out"
+
+          echo "::group::External module sources"
+          ls -la "${GITHUB_WORKSPACE}"/{Kbuild,Makefile,selinux_seqno_fix.c}
+          echo "::endgroup::"
+
           make -C "${GITHUB_WORKSPACE}/kernel_workspace/common" O="$KERNEL_OUT" M="${GITHUB_WORKSPACE}" \
             LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld HOSTLD=ld.lld \
             KBUILD_MODPOST_WARN="${KBUILD_MODPOST_WARN:-0}" \
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
+            V=1 \
             modules
-          test -f "${MODULE_NAME}.ko"
-          modinfo "${MODULE_NAME}.ko" | tee modinfo.txt || true
+
+          if [[ ! -f "${GITHUB_WORKSPACE}/${MODULE_NAME}.ko" ]]; then
+            echo "::error::External module build finished but ${MODULE_NAME}.ko was not produced."
+            echo "modules.order:"
+            cat "${GITHUB_WORKSPACE}/modules.order" 2>/dev/null || echo "<missing>"
+            ls -la "${GITHUB_WORKSPACE}" || true
+            exit 1
+          fi
+          modinfo "${GITHUB_WORKSPACE}/${MODULE_NAME}.ko" | tee modinfo.txt || true
 
       - name: Package artifacts
         run: |
