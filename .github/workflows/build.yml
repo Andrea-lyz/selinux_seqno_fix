@@ -17,7 +17,7 @@ on:
         description: Kernel localversion suffix, without leading dash
         required: true
         type: string
-        default: android15-8-g29d86c5fc9dd-abogki428889875-4k
+        default: android15-8-g7e1f3c083cc6-abogki467167594-4k
       full_kernel_build:
         description: Build in-tree modules first. Slower, useful when you need fresh Module.symvers from a full kernel build.
         required: true
@@ -59,7 +59,7 @@ jobs:
         env:
           KERNEL_REPO: ${{ inputs.kernel_repo || 'cctv18/android_kernel_common_oneplus_sm8750' }}
           KERNEL_BRANCH: ${{ inputs.kernel_branch || 'oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89' }}
-          KERNEL_SUFFIX: ${{ inputs.kernel_suffix || 'android15-8-g29d86c5fc9dd-abogki428889875-4k' }}
+          KERNEL_SUFFIX: ${{ inputs.kernel_suffix || 'android15-8-g7e1f3c083cc6-abogki467167594-4k' }}
         run: |
           set -euxo pipefail
           KERNEL_KEY="$(printf '%s-%s-%s' "$KERNEL_REPO" "$KERNEL_BRANCH" "$KERNEL_SUFFIX" | tr '/:@ ' '----')"

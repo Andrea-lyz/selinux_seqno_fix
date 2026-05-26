@@ -45,7 +45,7 @@ kernel source used by `fastbuild_6.6.89.yml`:
 - kernel branch: `oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89`
 - toolchain: `LLVM-Clang18-r510928`
 - default localversion suffix:
-  `android15-8-g29d86c5fc9dd-abogki428889875-4k`
+  `android15-8-g7e1f3c083cc6-abogki467167594-4k`
 
 Run **Build selinux_seqno_fix.ko** from the Actions tab. The artifact contains
 the raw `.ko` and a flashable KSU/Magisk-style zip that loads it from
@@ -65,6 +65,8 @@ should reuse the cached `out/` tree and finish much faster.
 The module must be built for the exact kernel release running on the phone.
 If `uname -r` differs, rerun the workflow with a matching `kernel_suffix` and
 kernel branch.
+The KSU service script writes load diagnostics to `load.log` in the module
+directory.
 
 ## Load
 
