@@ -162,16 +162,17 @@ jobs:
           export PATH="${GITHUB_WORKSPACE}/kernel_workspace/clang18/bin:${GITHUB_WORKSPACE}/kernel_workspace/build-tools/bin:${PATH}"
           KERNEL_OUT="${GITHUB_WORKSPACE}/kernel_workspace/out"
           cd kernel_workspace/common
+          KERNEL_SUFFIX="${KERNEL_SUFFIX#-}"
 
           rm -f android/abi_gki_protected_exports_* || true
           for f in scripts/setlocalversion; do
             sed -i 's/ -dirty//g' "$f"
             sed -i 's/${scm_version}//' "$f"
-            sed -i "\$s|echo \"\\\$res\"|echo \"-${KERNEL_SUFFIX}\"|" "$f"
+            sed -i -E '$s|echo ".*"|echo ""|' "$f"
           done
-          sed -i "s/-4k/-${KERNEL_SUFFIX}/g" arch/arm64/configs/gki_defconfig
-          grep -q '^CONFIG_LOCALVERSION_AUTO=n$' arch/arm64/configs/gki_defconfig || \
-            echo "CONFIG_LOCALVERSION_AUTO=n" >> arch/arm64/configs/gki_defconfig
+          sed -i '/^CONFIG_LOCALVERSION=/d' arch/arm64/configs/gki_defconfig
+          sed -i '/^CONFIG_LOCALVERSION_AUTO=/d' arch/arm64/configs/gki_defconfig
+          printf 'CONFIG_LOCALVERSION="-%s"\nCONFIG_LOCALVERSION_AUTO=n\n' "$KERNEL_SUFFIX" >> arch/arm64/configs/gki_defconfig
 
           make -j"$(nproc)" LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
