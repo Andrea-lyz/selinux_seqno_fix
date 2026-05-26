@@ -57,6 +57,11 @@ automatically builds `Image` once to generate the kernel symbol versions require
 by modpost. Enable `full_kernel_build` only when you want to force that slow path
 from the start.
 
+CI uses GitHub cache for downloaded archives, the unpacked kernel/toolchain, and
+`kernel_workspace/out`. The first run for a kernel branch/suffix is still
+slow because it has to populate `Module.symvers`; later module-only changes
+should reuse the cached `out/` tree and finish much faster.
+
 The module must be built for the exact kernel release running on the phone.
 If `uname -r` differs, rerun the workflow with a matching `kernel_suffix` and
 kernel branch.

@@ -54,6 +54,47 @@ jobs:
       - name: Checkout module source
         uses: actions/checkout@v4
 
+      - name: Resolve build inputs
+        id: vars
+        env:
+          KERNEL_REPO: ${{ inputs.kernel_repo || 'cctv18/android_kernel_common_oneplus_sm8750' }}
+          KERNEL_BRANCH: ${{ inputs.kernel_branch || 'oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89' }}
+          KERNEL_SUFFIX: ${{ inputs.kernel_suffix || 'android15-8-g29d86c5fc9dd-abogki428889875-4k' }}
+        run: |
+          set -euxo pipefail
+          KERNEL_KEY="$(printf '%s-%s-%s' "$KERNEL_REPO" "$KERNEL_BRANCH" "$KERNEL_SUFFIX" | tr '/:@ ' '----')"
+          echo "kernel_repo=$KERNEL_REPO" >> "$GITHUB_OUTPUT"
+          echo "kernel_branch=$KERNEL_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "kernel_suffix=$KERNEL_SUFFIX" >> "$GITHUB_OUTPUT"
+          echo "kernel_key=$KERNEL_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Restore download cache
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: downloads-${{ steps.vars.outputs.kernel_key }}-clang18-r510928
+          restore-keys: |
+            downloads-${{ steps.vars.outputs.kernel_key }}-
+
+      - name: Restore kernel source/toolchain cache
+        id: cache-base
+        uses: actions/cache@v4
+        with:
+          path: |
+            kernel_workspace/common
+            kernel_workspace/clang18
+            kernel_workspace/build-tools
+          key: kernel-base-${{ steps.vars.outputs.kernel_key }}-clang18-r510928-v2
+
+      - name: Restore kernel output cache
+        id: cache-out
+        uses: actions/cache@v4
+        with:
+          path: kernel_workspace/out
+          key: kernel-out-${{ steps.vars.outputs.kernel_key }}-clang18-r510928-v2-${{ hashFiles('selinux_seqno_fix.c', 'Makefile') }}
+          restore-keys: |
+            kernel-out-${{ steps.vars.outputs.kernel_key }}-clang18-r510928-v2-
+
       - name: Install build dependencies
         run: |
           sudo apt-mark hold firefox || true
@@ -66,37 +107,56 @@ jobs:
 
       - name: Fetch kernel source and toolchain
         env:
-          KERNEL_REPO: ${{ inputs.kernel_repo || 'cctv18/android_kernel_common_oneplus_sm8750' }}
-          KERNEL_BRANCH: ${{ inputs.kernel_branch || 'oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89' }}
+          KERNEL_REPO: ${{ steps.vars.outputs.kernel_repo }}
+          KERNEL_BRANCH: ${{ steps.vars.outputs.kernel_branch }}
         run: |
           set -euxo pipefail
-          rm -rf kernel_workspace
-          mkdir -p kernel_workspace
+          mkdir -p kernel_workspace downloads
           cd kernel_workspace
 
-          SOURCE_URL="https://github.com/${KERNEL_REPO}/archive/refs/heads/${KERNEL_BRANCH}.zip"
-          aria2c -s16 -x16 -k1M "$SOURCE_URL" -o common.zip
-          unzip -q common.zip
-          KERNEL_DIR="$(find . -maxdepth 1 -mindepth 1 -type d | head -n 1)"
-          test -n "$KERNEL_DIR"
-          mv "$KERNEL_DIR" common
-          rm -f common.zip
+          if [[ ! -f common/Makefile ]]; then
+            rm -rf common source-unpack
+            SOURCE_URL="https://github.com/${KERNEL_REPO}/archive/refs/heads/${KERNEL_BRANCH}.zip"
+            if [[ ! -s ../downloads/common.zip ]]; then
+              aria2c -s16 -x16 -k1M "$SOURCE_URL" -o ../downloads/common.zip
+            fi
+            mkdir source-unpack
+            unzip -q ../downloads/common.zip -d source-unpack
+            KERNEL_DIR="$(find source-unpack -maxdepth 1 -mindepth 1 -type d | head -n 1)"
+            test -n "$KERNEL_DIR"
+            mv "$KERNEL_DIR" common
+            rm -rf source-unpack
+          else
+            echo "Using cached kernel source."
+          fi
 
-          mkdir -p clang18
-          aria2c -s16 -x16 -k1M "${TOOLCHAIN_URL}/clang-r510928.zip" -o clang.zip
-          unzip -q clang.zip -d clang18
-          rm -f clang.zip
+          if [[ ! -x clang18/bin/clang ]]; then
+            rm -rf clang18
+            mkdir -p clang18
+            if [[ ! -s ../downloads/clang-r510928.zip ]]; then
+              aria2c -s16 -x16 -k1M "${TOOLCHAIN_URL}/clang-r510928.zip" -o ../downloads/clang-r510928.zip
+            fi
+            unzip -q ../downloads/clang-r510928.zip -d clang18
+          else
+            echo "Using cached clang18."
+          fi
 
-          aria2c -s16 -x16 -k1M "${TOOLCHAIN_URL}/build-tools.zip" -o build-tools.zip
-          unzip -q build-tools.zip
-          rm -f build-tools.zip
+          if [[ ! -d build-tools/bin ]]; then
+            if [[ ! -s ../downloads/build-tools.zip ]]; then
+              aria2c -s16 -x16 -k1M "${TOOLCHAIN_URL}/build-tools.zip" -o ../downloads/build-tools.zip
+            fi
+            unzip -q ../downloads/build-tools.zip
+          else
+            echo "Using cached build-tools."
+          fi
 
       - name: Configure kernel tree
         env:
-          KERNEL_SUFFIX: ${{ inputs.kernel_suffix || 'android15-8-g29d86c5fc9dd-abogki428889875-4k' }}
+          KERNEL_SUFFIX: ${{ steps.vars.outputs.kernel_suffix }}
         run: |
           set -euxo pipefail
           export PATH="${GITHUB_WORKSPACE}/kernel_workspace/clang18/bin:${GITHUB_WORKSPACE}/kernel_workspace/build-tools/bin:${PATH}"
+          KERNEL_OUT="${GITHUB_WORKSPACE}/kernel_workspace/out"
           cd kernel_workspace/common
 
           rm -f android/abi_gki_protected_exports_* || true
@@ -111,14 +171,14 @@ jobs:
 
           make -j"$(nproc)" LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O="$KERNEL_OUT" \
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
             gki_defconfig
 
-          grep -E 'CONFIG_(MODULES|KPROBES|KRETPROBES)=' out/.config || true
-          grep -q '^CONFIG_MODULES=y$' out/.config
-          grep -q '^CONFIG_KPROBES=y$' out/.config
-          grep -q '^CONFIG_KRETPROBES=y$' out/.config
+          grep -E 'CONFIG_(MODULES|KPROBES|KRETPROBES)=' "$KERNEL_OUT/.config" || true
+          grep -q '^CONFIG_MODULES=y$' "$KERNEL_OUT/.config"
+          grep -q '^CONFIG_KPROBES=y$' "$KERNEL_OUT/.config"
+          grep -q '^CONFIG_KRETPROBES=y$' "$KERNEL_OUT/.config"
 
       - name: Prepare kernel build outputs
         env:
@@ -127,6 +187,7 @@ jobs:
           set -euxo pipefail
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           export PATH="${GITHUB_WORKSPACE}/kernel_workspace/clang18/bin:${GITHUB_WORKSPACE}/kernel_workspace/build-tools/bin:${PATH}"
+          KERNEL_OUT="${GITHUB_WORKSPACE}/kernel_workspace/out"
           cd kernel_workspace/common
 
           build_image_for_symvers() {
@@ -134,7 +195,7 @@ jobs:
             echo "::group::Build kernel Image for Module.symvers"
             if ! make -j"$(nproc)" LLVM=1 ARCH=arm64 \
               CROSS_COMPILE=aarch64-linux-gnu- \
-              CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+              CC=clang LD=ld.lld HOSTLD=ld.lld O="$KERNEL_OUT" \
               KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
               Image >"$log" 2>&1; then
               tail -n 300 "$log" || true
@@ -151,23 +212,23 @@ jobs:
 
           make -j"$(nproc)" LLVM=1 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O="$KERNEL_OUT" \
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
             modules_prepare
 
-          make -s LLVM=1 ARCH=arm64 O=out kernelrelease | tee "${GITHUB_WORKSPACE}/kernelrelease.txt"
-          if [[ ! -s out/Module.symvers ]]; then
-            echo "::warning::out/Module.symvers is missing after modules_prepare; building Image once to generate kernel symbol versions."
+          make -s LLVM=1 ARCH=arm64 O="$KERNEL_OUT" kernelrelease | tee "${GITHUB_WORKSPACE}/kernelrelease.txt"
+          if [[ ! -s "$KERNEL_OUT/Module.symvers" ]]; then
+            echo "::warning::Module.symvers is missing after modules_prepare; building Image once to generate kernel symbol versions."
             build_image_for_symvers
             make -j"$(nproc)" LLVM=1 ARCH=arm64 \
               CROSS_COMPILE=aarch64-linux-gnu- \
-              CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+              CC=clang LD=ld.lld HOSTLD=ld.lld O="$KERNEL_OUT" \
               KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
               modules_prepare
           fi
 
-          if [[ ! -s out/Module.symvers ]]; then
-            echo "::error::out/Module.symvers is still missing after Image build; cannot produce a reliable loadable .ko for this kernel."
+          if [[ ! -s "$KERNEL_OUT/Module.symvers" ]]; then
+            echo "::error::Module.symvers is still missing after Image build; cannot produce a reliable loadable .ko for this kernel."
             exit 1
           fi
 
@@ -175,7 +236,8 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${GITHUB_WORKSPACE}/kernel_workspace/clang18/bin:${GITHUB_WORKSPACE}/kernel_workspace/build-tools/bin:${PATH}"
-          make -C "${GITHUB_WORKSPACE}/kernel_workspace/common" O=out M="${GITHUB_WORKSPACE}" \
+          KERNEL_OUT="${GITHUB_WORKSPACE}/kernel_workspace/out"
+          make -C "${GITHUB_WORKSPACE}/kernel_workspace/common" O="$KERNEL_OUT" M="${GITHUB_WORKSPACE}" \
             LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC=clang LD=ld.lld HOSTLD=ld.lld \
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
