@@ -1,0 +1,185 @@
+name: Build selinux_seqno_fix.ko
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: Kernel source repository
+        required: true
+        type: string
+        default: cctv18/android_kernel_common_oneplus_sm8750
+      kernel_branch:
+        description: Kernel source branch
+        required: true
+        type: string
+        default: oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89
+      kernel_suffix:
+        description: Kernel localversion suffix, without leading dash
+        required: true
+        type: string
+        default: android15-8-g29d86c5fc9dd-abogki428889875-4k
+      full_kernel_build:
+        description: Build Image before external module for best Module.symvers/vermagic match
+        required: true
+        type: choice
+        default: 'true'
+        options:
+          - 'true'
+          - 'false'
+  push:
+    branches:
+      - main
+    paths:
+      - Makefile
+      - selinux_seqno_fix.c
+      - README.md
+      - ksu-module/**
+      - .github/workflows/build.yml
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+  ARCH: arm64
+  TOOLCHAIN_URL: https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928
+  MODULE_NAME: selinux_seqno_fix
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout module source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-mark hold firefox || true
+          sudo apt-mark hold libc-bin || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            aria2 bc bison build-essential ca-certificates cpio curl dwarves \
+            flex git kmod libelf-dev libssl-dev make perl python-is-python3 \
+            python3 rsync unzip xz-utils zip
+
+      - name: Fetch kernel source and toolchain
+        env:
+          KERNEL_REPO: ${{ inputs.kernel_repo || 'cctv18/android_kernel_common_oneplus_sm8750' }}
+          KERNEL_BRANCH: ${{ inputs.kernel_branch || 'oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89' }}
+        run: |
+          set -euxo pipefail
+          rm -rf kernel_workspace
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          SOURCE_URL="https://github.com/${KERNEL_REPO}/archive/refs/heads/${KERNEL_BRANCH}.zip"
+          aria2c -s16 -x16 -k1M "$SOURCE_URL" -o common.zip
+          unzip -q common.zip
+          KERNEL_DIR="$(find . -maxdepth 1 -mindepth 1 -type d | head -n 1)"
+          test -n "$KERNEL_DIR"
+          mv "$KERNEL_DIR" common
+          rm -f common.zip
+
+          mkdir -p clang18
+          aria2c -s16 -x16 -k1M "${TOOLCHAIN_URL}/clang-r510928.zip" -o clang.zip
+          unzip -q clang.zip -d clang18
+          rm -f clang.zip
+
+          aria2c -s16 -x16 -k1M "${TOOLCHAIN_URL}/build-tools.zip" -o build-tools.zip
+          unzip -q build-tools.zip
+          rm -f build-tools.zip
+
+      - name: Configure kernel tree
+        env:
+          KERNEL_SUFFIX: ${{ inputs.kernel_suffix || 'android15-8-g29d86c5fc9dd-abogki428889875-4k' }}
+        run: |
+          set -euxo pipefail
+          export PATH="${GITHUB_WORKSPACE}/kernel_workspace/clang18/bin:${GITHUB_WORKSPACE}/kernel_workspace/build-tools/bin:${PATH}"
+          cd kernel_workspace/common
+
+          rm -f android/abi_gki_protected_exports_* || true
+          for f in scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' "$f"
+            sed -i 's/${scm_version}//' "$f"
+            sed -i "\$s|echo \"\\\$res\"|echo \"-${KERNEL_SUFFIX}\"|" "$f"
+          done
+          sed -i "s/-4k/-${KERNEL_SUFFIX}/g" arch/arm64/configs/gki_defconfig
+          grep -q '^CONFIG_LOCALVERSION_AUTO=n$' arch/arm64/configs/gki_defconfig || \
+            echo "CONFIG_LOCALVERSION_AUTO=n" >> arch/arm64/configs/gki_defconfig
+
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
+            gki_defconfig
+
+          grep -E 'CONFIG_(MODULES|KPROBES|KRETPROBES)=' out/.config || true
+          grep -q '^CONFIG_MODULES=y$' out/.config
+          grep -q '^CONFIG_KPROBES=y$' out/.config
+          grep -q '^CONFIG_KRETPROBES=y$' out/.config
+
+      - name: Prepare kernel build outputs
+        env:
+          FULL_KERNEL_BUILD: ${{ inputs.full_kernel_build || 'true' }}
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          export PATH="${GITHUB_WORKSPACE}/kernel_workspace/clang18/bin:${GITHUB_WORKSPACE}/kernel_workspace/build-tools/bin:${PATH}"
+          cd kernel_workspace/common
+
+          if [[ "$FULL_KERNEL_BUILD" == "true" ]]; then
+            make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+              KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
+              Image
+          fi
+
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
+            modules_prepare
+
+          make -s LLVM=1 ARCH=arm64 O=out kernelrelease | tee "${GITHUB_WORKSPACE}/kernelrelease.txt"
+          if [[ ! -s out/Module.symvers ]]; then
+            echo "::warning::out/Module.symvers is missing or empty; the module may only load on kernels without modversion requirements."
+          fi
+
+      - name: Build external module
+        run: |
+          set -euxo pipefail
+          export PATH="${GITHUB_WORKSPACE}/kernel_workspace/clang18/bin:${GITHUB_WORKSPACE}/kernel_workspace/build-tools/bin:${PATH}"
+          make -C "${GITHUB_WORKSPACE}/kernel_workspace/common" O=out M="${GITHUB_WORKSPACE}" \
+            LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld HOSTLD=ld.lld \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error \
+            modules
+          test -f "${MODULE_NAME}.ko"
+          modinfo "${MODULE_NAME}.ko" | tee modinfo.txt || true
+
+      - name: Package artifacts
+        run: |
+          set -euxo pipefail
+          KERNEL_RELEASE="$(cat kernelrelease.txt)"
+          VERSION_TAG="${KERNEL_RELEASE}-${GITHUB_RUN_NUMBER}"
+          ARTIFACT_DIR="artifacts/${MODULE_NAME}-${KERNEL_RELEASE}"
+          mkdir -p "$ARTIFACT_DIR" package
+
+          cp "${MODULE_NAME}.ko" "$ARTIFACT_DIR/"
+          cp modinfo.txt kernelrelease.txt "$ARTIFACT_DIR/"
+          sha256sum "$ARTIFACT_DIR/${MODULE_NAME}.ko" | tee "$ARTIFACT_DIR/${MODULE_NAME}.ko.sha256"
+
+          cp -r ksu-module/* package/
+          cp "${MODULE_NAME}.ko" package/
+          (cd package && zip -r "../$ARTIFACT_DIR/${MODULE_NAME}-ksu-module-${VERSION_TAG}.zip" .)
+
+          (cd artifacts && zip -r "${MODULE_NAME}-${VERSION_TAG}.zip" "${MODULE_NAME}-${KERNEL_RELEASE}")
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: selinux_seqno_fix-ko
+          path: artifacts/**

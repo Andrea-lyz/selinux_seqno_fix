@@ -1,0 +1,6 @@
+id=selinux_seqno_fix
+name=SELinux Seqno Fix
+version=v0.1
+versionCode=1
+author=Andrea-Lyz
+description=Load selinux_seqno_fix.ko to keep SELinux /access seqno metadata aligned with /status policyload.
