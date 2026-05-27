@@ -21,6 +21,14 @@
 > observable state consistent with what AOSP would produce without KSU
 > installed. If you're looking for a "cheat" — this isn't one; it's a
 > correctness patch for a metadata side-channel leak.
+>
+> **The detector premise is itself questionable.** AOSP does not actually
+> guarantee `status.policyload == access.avd.seqno`; the two counters track
+> different things (policy reload generation vs. AVC cache generation) and
+> diverge naturally on any device that has ever changed an SELinux boolean.
+> Detectors that treat equality as a coherence contract are extrapolating
+> from an empirical observation, not a kernel API. We mirror their
+> assumption only because it is the one shipping in the wild.
 
 Tiny Android kernel module for the SELinux `/sys/fs/selinux/status` and
 `/sys/fs/selinux/access` seqno split exposed by KernelSU policy hiding.
@@ -52,49 +60,49 @@ the AOSP coherence contract.
 ## How it works
 
 1. At load, the module resolves `selinux_kernel_status_page()` and
-   `avc_policy_seqno()` with one-shot kprobes, maps the status page, and seeds
-   `status.policyload` from `avc_policy_seqno()`.
-2. A kretprobe on `selinux_status_update_policyload` republishes the AVC seqno
-   into the status page right after every update, including KSU's `update(0)`
-   stomp. The republish bumps `status.sequence` to odd, writes the new
-   `policyload`, then bumps `status.sequence` back to even, with `smp_wmb()`
-   between, mirroring `selinux_status_update_status()`.
-3. A kretprobe on `security_compute_av_user` acts as a continuous safety net:
-   if any path slips through (or `selinux_status_update_policyload` cannot be
-   probed), the userspace `/access` query path will trigger the same repair
-   using the `avd.seqno` it just produced.
+   `avc_policy_seqno()` with one-shot kprobes, maps the status page, and runs
+   one **conditional** seed pass (see "Bounded repair" below).
+2. A kretprobe on `selinux_status_update_policyload` is the primary trigger.
+   It only republishes the AVC seqno when `status.policyload == 0` is
+   observed; any non-zero value (including a freshly bumped value from a
+   real `sel_write_load() -> security_load_policy()` hot reload) passes
+   straight through to userspace. This keeps libselinux and `servicemanager`
+   able to detect real policy reloads through their normal status-page
+   channel.
+3. A kretprobe on `security_compute_av_user` acts as a safety net for the
+   case where the policyload symbol cannot be probed or where the stomp
+   happened before the module was loaded.
+4. When the module does write, it uses the same seqlock writer protocol
+   (`sequence` even -> odd -> even+2 with `smp_wmb()` between writes) that
+   `selinux_status_update_status()` uses, so userspace seqlock-stable
+   readers never observe a torn page. `status.sequence` is only ever
+   advanced; we never roll it back.
 
-## Build
+## Bounded repair
 
-You need the exact kernel build tree for the running kernel, including matching
-`.config`, `Module.symvers`, compiler, and vermagic.
+The repair is gated to one specific pattern: **`status.policyload` was just
+set to 0 and the AVC has a positive seqno**. Anything else is left
+untouched. Concretely:
 
-```sh
-make KDIR=/path/to/kernel/source O=/path/to/kernel/out ARCH=arm64 LLVM=1
-```
+| State observed                                                | Action               |
+|---------------------------------------------------------------|----------------------|
+| `policyload == 0`, `avc_seqno > 0` (KSU stomp)                | Repair               |
+| `policyload > 0` (real hot reload, or already-coherent state) | Pass through         |
+| `policyload == 0`, `avc_seqno == 0` (pre-6.12 boot early)     | Pass through         |
+| 6.12+ early boot baseline `sequence=4, policyload=1`          | Pass through         |
 
-If the kernel was built in-tree, omit `O`:
+This is the second-iteration design after maintainer feedback. The earlier
+"unconditionally align policyload to avc_seqno" approach would have
+suppressed the userspace-visible signal of a real policy hot reload,
+breaking `servicemanager`'s policy-change detection and any other consumer
+of `selinux_status_open() / selinux_status_updated()`. The current gate
+preserves every legitimate userspace cache-flush signal and only filters
+out the artificial KSU stomp.
 
-```sh
-make KDIR=/path/to/kernel/source ARCH=arm64 LLVM=1
-```
+## Build target
 
-Output:
-
-```text
-selinux_seqno_fix.ko
-```
-
-The module's `obj-m` declaration lives in `Kbuild`, with `Makefile` only
-providing the wrapper targets. Do not collapse them back into a single
-`Makefile` with a `KERNELRELEASE` guard: in some Android 6.6 kbuild trees the
-guard form silently produces an empty `obj-m` for the external pass and
-modpost finishes without compiling anything.
-
-## GitHub Actions
-
-The included workflow builds against the OnePlus/OPlus/Realme SM8750 6.6.89
-kernel source used by `fastbuild_6.6.89.yml`:
+The bundled GitHub Actions workflow builds for the maintainer's own
+device against the OnePlus 13 SM8750 6.6.89 kernel:
 
 - kernel repo: `cctv18/android_kernel_common_oneplus_sm8750`
 - kernel branch: `oneplus/sm8750_v_16.0.0_oneplus_13_6.6.89`
@@ -102,28 +110,51 @@ kernel source used by `fastbuild_6.6.89.yml`:
 - default localversion suffix:
   `android15-8-g7e1f3c083cc6-abogki467167594-4k`
 
-Run **Build selinux_seqno_fix.ko** from the Actions tab. The artifact contains
-the raw `.ko` and a flashable KSU/Magisk-style zip that loads it from
-`service.sh`.
+For other kernels you must build the module yourself against the matching
+kernel tree. The C source itself is portable to any arm64 Android kernel
+that exports (or has resolvable via kallsyms) `selinux_kernel_status_page`,
+`selinux_status_update_policyload`, `avc_policy_seqno`, and
+`security_compute_av_user`. Pull the source, point `KDIR` at your kernel,
+and build:
 
-The workflow tries the fast path first: `gki_defconfig`, `modules_prepare`, and
-then the external module build. If `out/Module.symvers` is missing, it
-automatically builds in-tree `modules` once to generate the kernel symbol
-versions required by modpost. Enable `full_kernel_build` only when you want to
-force that slow path from the start.
+```sh
+make KDIR=/path/to/kernel/source O=/path/to/kernel/out ARCH=arm64 LLVM=1
+```
 
-CI uses GitHub cache for downloaded archives, the unpacked kernel/toolchain, and
-`kernel_workspace/out`. The first run for a kernel branch/suffix is still
-slow because it has to populate `Module.symvers`; later module-only changes
-should reuse the cached `out/` tree and finish much faster.
+The module's `obj-m` declaration lives in `Kbuild`, with `Makefile` only
+providing the wrapper targets. Do not collapse them back into a single
+`Makefile` with a `KERNELRELEASE` guard: in some Android 6.6 kbuild trees
+the guard form silently produces an empty `obj-m` for the external pass
+and modpost finishes without compiling anything.
 
-The module must be built for the exact kernel release running on the phone.
-If `uname -r` differs, rerun the workflow with a matching `kernel_suffix` and
-kernel branch.
-The KSU service script writes load diagnostics to `load.log` in the module
-directory.
-The module also exposes diagnostic counters under
-`/sys/module/selinux_seqno_fix/parameters/`.
+Output:
+
+```text
+selinux_seqno_fix.ko
+```
+
+## GitHub Actions
+
+Run **Build selinux_seqno_fix.ko** from the Actions tab. The artifact
+contains the raw `.ko` and a flashable KSU/Magisk-style zip that loads it
+from `service.sh`.
+
+The workflow tries the fast path first: `gki_defconfig`,
+`modules_prepare`, and then the external module build. If
+`out/Module.symvers` is missing, it automatically builds in-tree `modules`
+once to generate the kernel symbol versions required by modpost. Enable
+`full_kernel_build` only when you want to force that slow path from the
+start.
+
+CI uses GitHub cache for downloaded archives, the unpacked
+kernel/toolchain, and `kernel_workspace/out`. The first run for a kernel
+branch/suffix is still slow because it has to populate `Module.symvers`;
+later module-only changes should reuse the cached `out/` tree and finish
+much faster.
+
+The CI artifact is built for one specific kernel release. If `uname -r`
+on your phone differs, build locally or rerun the workflow with a matching
+`kernel_suffix` and kernel branch.
 
 ## Load
 
@@ -132,18 +163,26 @@ su -c 'insmod /data/local/tmp/selinux_seqno_fix.ko'
 su -c 'dmesg | grep selinux_seqno_fix'
 ```
 
-After loading, confirm the kretprobes are firing and the repair has happened:
+After loading, confirm the kretprobes are in place and what they have
+done so far:
 
 ```sh
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/policyload_hook_hits'
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/hits'
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/fixups'
+su -c 'cat /sys/module/selinux_seqno_fix/parameters/passthrough'
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_status_sequence'
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_status_policyload'
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_avc_policy_seqno'
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_avd_seqno'
 su -c 'cat /sys/module/selinux_seqno_fix/parameters/last_repair_target'
 ```
+
+`fixups` should advance every time KSU stomps; `passthrough` should
+advance for the post-stomp baseline reads and for any real policy hot
+reload (e.g. a `setbool` triggered from userspace). If `fixups` is large
+and `passthrough` is zero you are probably observing a build that never
+hot-reloads policy, which is normal on most production devices.
 
 Disable without unloading:
 
@@ -160,8 +199,9 @@ su -c 'rmmod selinux_seqno_fix'
 ## Notes
 
 - Requires `CONFIG_KPROBES` and `CONFIG_KRETPROBES`.
-- Resolves `selinux_kernel_status_page()`, `selinux_status_update_policyload()`
-  and `avc_policy_seqno()` via temporary kprobes at load time.
+- Resolves `selinux_kernel_status_page()`,
+  `selinux_status_update_policyload()` and `avc_policy_seqno()` via
+  temporary kprobes at load time.
 - Designed for arm64 Android kernels.
 - If the primary `selinux_status_update_policyload` kretprobe cannot be
   registered, the module continues with the `security_compute_av_user`-only
@@ -170,20 +210,22 @@ su -c 'rmmod selinux_seqno_fix'
 
 ## Lifetime / when to retire this module
 
-This module is a workaround for a single, well-localized KernelSU side effect.
-It is expected to be obsoleted upstream. The cleanest fix is in KernelSU
-itself: drop `selinux_status_update_policyload(0)` from `apply_kernelsu_rules()`
-in `kernel/selinux/rules.c`. KSU's hook rules patch `avd.allowed` directly, so
-nothing needs to invalidate the userspace SELinux status page; the call is
-collateral damage left over from an earlier design.
+This module is a workaround for a single, well-localized KernelSU side
+effect. It is expected to be obsoleted upstream. The cleanest fix is in
+KernelSU itself: drop `selinux_status_update_policyload(0)` from
+`apply_kernelsu_rules()` in `kernel/selinux/rules.c`. KSU's hook rules
+patch `avd.allowed` directly, so nothing needs to invalidate the
+userspace SELinux status page; the call is collateral damage left over
+from an earlier design.
 
 When that lands upstream:
 
-1. The split goes away on its own — `status.policyload` no longer gets stomped.
-2. The Duck Detector / `ksu-edge-seqno-demo` policyload/avd.seqno oracle returns
-   to `clean` without any kernel module.
-3. This repo should be archived. Keep the tag/release as a historical record
-   of the side effect and stop using `insmod selinux_seqno_fix.ko`.
+1. The split goes away on its own — `status.policyload` no longer gets
+   stomped.
+2. The Duck Detector / `ksu-edge-seqno-demo` policyload/avd.seqno oracle
+   returns to `clean` without any kernel module.
+3. This repo should be archived. Keep the tag/release as a historical
+   record of the side effect and stop using `insmod selinux_seqno_fix.ko`.
 
 Until then, treat this module as a short-lived patch, not a long-term
 component. No new detectors or features should be built around it.

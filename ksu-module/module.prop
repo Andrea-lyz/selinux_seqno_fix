@@ -1,6 +1,6 @@
 id=selinux_seqno_fix
 name=SELinux Seqno Fix
-version=v0.3
-versionCode=3
+version=v0.4
+versionCode=4
 author=Andrea-Lyz
-description=Restore SELinux /sys/fs/selinux/status policyload to the live AVC seqno via a seqlock-style write whenever KernelSU stomps it to 0.
+description=Restore SELinux /sys/fs/selinux/status policyload only when KSU stomps it to 0; real policy hot reloads (positive policyload writes) pass through unchanged so libselinux/servicemanager can still flush their AVC caches.

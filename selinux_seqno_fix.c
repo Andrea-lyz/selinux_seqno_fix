@@ -1,14 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Restore the SELinux status page policyload back to the live AVC seqno when
- * KernelSU zeroes it via selinux_status_update_policyload(0). The repair is
- * applied through a seqlock dance that mirrors the kernel's own writer path,
- * so user-space readers of /sys/fs/selinux/status see a coherent
- *   status.policyload == access.avd.seqno
- * baseline whenever the AVC has produced a positive seqno.
+ * Repair the SELinux status page after KernelSU's policy-hiding hook stomps
+ * `status.policyload` to 0 via apply_kernelsu_rules() ->
+ * selinux_status_update_policyload(0). The repair publishes the live AVC
+ * seqno through the same seqlock writer protocol the kernel itself uses, so
+ * userspace seqlock readers never observe a torn intermediate state.
  *
- * This module never alters allowed/auditallow/auditdeny/flags and never
- * influences access decisions; it only patches the metadata page.
+ * Strictly bounded behavior:
+ *   - We only intervene when status.policyload was just set to 0 *and* the
+ *     AVC has a positive policy seqno to restore from. Any non-zero
+ *     status.policyload — including a freshly bumped value from a real
+ *     sel_write_load() / security_load_policy() hot reload — is left
+ *     completely alone, so libselinux and servicemanager continue to
+ *     observe the kernel's own monotonic policyload increments and refresh
+ *     their AVC caches accordingly.
+ *   - status.sequence is always advanced monotonically (even -> odd ->
+ *     even+2) by our seqlock writer; we never roll it back or block the
+ *     kernel's own increments.
+ *
+ * The repair never touches allowed/auditallow/auditdeny/flags and never
+ * influences access decisions; it only restores metadata that KSU's own
+ * code zeroes for what is really only a userspace-cache-flush side
+ * channel.
  */
 
 #define pr_fmt(fmt) "selinux_seqno_fix: " fmt
@@ -54,6 +67,7 @@ static bool enabled = true;
 static unsigned long av_user_hits;
 static unsigned long policyload_hook_hits;
 static unsigned long status_fixups;
+static unsigned long status_passthrough;
 static unsigned long av_user_no_status;
 static unsigned long av_user_null_avd;
 static unsigned int last_status_sequence;
@@ -69,9 +83,11 @@ MODULE_PARM_DESC(hits, "Number of security_compute_av_user returns observed");
 module_param_named(policyload_hook_hits, policyload_hook_hits, ulong, 0444);
 MODULE_PARM_DESC(policyload_hook_hits, "Number of selinux_status_update_policyload returns observed");
 module_param_named(fixups, status_fixups, ulong, 0444);
-MODULE_PARM_DESC(fixups, "Number of SELinux status policyload values rewritten");
+MODULE_PARM_DESC(fixups, "Number of policyload-stomp repairs that actually wrote the page");
 module_param_named(status_fixups, status_fixups, ulong, 0444);
-MODULE_PARM_DESC(status_fixups, "Number of SELinux status policyload values rewritten");
+MODULE_PARM_DESC(status_fixups, "Number of policyload-stomp repairs that actually wrote the page");
+module_param_named(passthrough, status_passthrough, ulong, 0444);
+MODULE_PARM_DESC(passthrough, "Number of returns where status.policyload was non-zero and the page was left untouched (real hot reloads or already-coherent baseline)");
 module_param_named(no_policyload, av_user_no_status, ulong, 0444);
 MODULE_PARM_DESC(no_policyload, "Number of returns skipped because SELinux status was unavailable");
 module_param_named(no_status, av_user_no_status, ulong, 0444);
@@ -79,9 +95,9 @@ MODULE_PARM_DESC(no_status, "Number of returns skipped because SELinux status wa
 module_param_named(null_avd, av_user_null_avd, ulong, 0444);
 MODULE_PARM_DESC(null_avd, "Number of returns skipped because the av_decision pointer was missing");
 module_param_named(last_status_sequence, last_status_sequence, uint, 0444);
-MODULE_PARM_DESC(last_status_sequence, "Last SELinux status sequence observed before repair");
+MODULE_PARM_DESC(last_status_sequence, "Last SELinux status sequence observed before any repair attempt");
 module_param_named(last_status_policyload, last_status_policyload, uint, 0444);
-MODULE_PARM_DESC(last_status_policyload, "Last SELinux status policyload observed before repair");
+MODULE_PARM_DESC(last_status_policyload, "Last SELinux status policyload observed before any repair attempt");
 module_param_named(last_avc_policy_seqno, last_avc_policy_seqno, uint, 0444);
 MODULE_PARM_DESC(last_avc_policy_seqno, "Last AVC policy seqno observed");
 module_param_named(last_avd_seqno, last_avd_seqno, uint, 0444);
@@ -143,10 +159,11 @@ static bool status_page_ready(struct selinux_kernel_status_compat **out)
 
 /*
  * Mirror selinux_status_update_status()'s seqlock writer side: bump sequence
- * to an odd value, publish the new policyload, then bump back to even. This
- * keeps userspace readers (the demo's seqlock-stable read loop in
- * KsuEdgeDetector.readSelinuxStatusStable) from seeing a torn intermediate
- * state.
+ * to an odd value, publish the new policyload, then bump sequence back to an
+ * even value, with smp_wmb() between writes. This is monotonic; we never
+ * roll the sequence number back, so userspace readers that latch on
+ * sequence advance always see at least the same number of "things changed"
+ * notifications as without this module loaded.
  */
 static void seqlock_publish_policyload(struct selinux_kernel_status_compat *status,
 				       u32 target)
@@ -165,9 +182,22 @@ static void seqlock_publish_policyload(struct selinux_kernel_status_compat *stat
 }
 
 /*
- * Restore status.policyload to the supplied target. Skipped when target is 0
- * (we never want to advertise a fresh-policy baseline if we don't actually
- * have a positive AVC seqno) or when status already matches.
+ * Strictly bounded repair entry point. Returns true when the status page was
+ * examined (whether or not we wrote it), false when we could not even
+ * inspect it (no target, or status page not yet mapped).
+ *
+ * The gate inside the lock is the project's whole semantic claim:
+ *
+ *   "Only repair the KSU stomp-to-zero pattern. Leave every other state of
+ *    status.policyload — including post-boot baselines, setbool-induced
+ *    AVC seqno advances, and real hot policy reloads — completely
+ *    untouched."
+ *
+ * This keeps libselinux and servicemanager's policy-change observation
+ * channel intact: a real hot reload writes a positive policyload and we
+ * never overwrite it; a setbool advances avc_policy_seqno without bumping
+ * status.policyload (which is normal AOSP behavior, even though some
+ * detectors wrongly assume the two must match) and we leave that alone too.
  */
 static bool repair_status_policyload(u32 target)
 {
@@ -189,27 +219,43 @@ static bool repair_status_policyload(u32 target)
 	WRITE_ONCE(last_status_sequence, sequence_before);
 	WRITE_ONCE(last_status_policyload, policyload_before);
 
-	if (policyload_before == target) {
+	if (policyload_before != 0) {
+		/*
+		 * Either the page is already at a positive baseline (e.g.
+		 * 6.12+ early boot 4/1, or any post-boot 6.6 state after a
+		 * real load_policy), or a real hot reload just wrote a new
+		 * positive policyload that userspace must observe. Hands off.
+		 */
+		bump_counter(&status_passthrough);
 		spin_unlock_irqrestore(&status_repair_lock, flags);
 		return true;
 	}
 
+	/*
+	 * policyload_before == 0 here. On pre-6.12 kernels this is also the
+	 * legitimate very-early-boot state, but in that case avc_policy_seqno
+	 * is also 0 and the !target check above already returned false; so by
+	 * the time we reach this point we have target > 0, meaning the AVC
+	 * has at least one policy generation, meaning the only way for
+	 * status.policyload to still be 0 is the KSU stomp.
+	 */
 	seqlock_publish_policyload(status, target);
 	WRITE_ONCE(last_repair_target, target);
 	bump_counter(&status_fixups);
 
 	spin_unlock_irqrestore(&status_repair_lock, flags);
 
-	pr_debug("repaired status.policyload %u -> %u (seq %u)\n",
-		 policyload_before, target, sequence_before);
+	pr_debug("repaired KSU policyload stomp 0 -> %u (seq %u)\n",
+		 target, sequence_before);
 	return true;
 }
 
 /*
- * security_compute_av_user kretprobe: a continuous safety net that observes
- * the live av_decision and re-aligns the status page if KSU's policyload
- * stomp slipped through between the policy-load hook firing and the
- * userspace probe issuing its /access transaction.
+ * security_compute_av_user kretprobe: a continuous safety net. If the
+ * primary kretprobe on selinux_status_update_policyload could not be
+ * registered (e.g. the symbol got inlined or LTO'd out on this build), or
+ * if KSU stomped before the module was loaded, this path catches the
+ * stomp lazily on the next userspace /access query.
  */
 static int seqno_fix_entry_handler(struct kretprobe_instance *ri,
 				   struct pt_regs *regs)
@@ -231,7 +277,6 @@ static int seqno_fix_return_handler(struct kretprobe_instance *ri,
 {
 	struct seqno_fix_data *data = (struct seqno_fix_data *)ri->data;
 	struct av_decision_compat *avd = data->avd;
-	struct selinux_kernel_status_compat *status;
 	u32 avd_seqno;
 	u32 avc_seqno;
 	u32 target;
@@ -250,14 +295,11 @@ static int seqno_fix_return_handler(struct kretprobe_instance *ri,
 	if (avd_seqno)
 		WRITE_ONCE(last_avd_seqno, avd_seqno);
 
-	if (!status_page_ready(&status)) {
-		bump_counter(&av_user_no_status);
-		return 0;
-	}
-
 	avc_seqno = read_avc_policy_seqno();
 	target = avc_seqno ? avc_seqno : avd_seqno;
-	repair_status_policyload(target);
+
+	if (!repair_status_policyload(target))
+		bump_counter(&av_user_no_status);
 	return 0;
 }
 
@@ -272,17 +314,14 @@ static struct kretprobe compute_av_user_kretprobe = {
 };
 
 /*
- * selinux_status_update_policyload kretprobe: the primary trigger. Whenever
- * something (the legitimate policy load, or KSU's apply_kernelsu_rules ->
- * selinux_status_update_policyload(0) stomp) updates the status page, we
- * compare against the live AVC seqno and, if they disagree, republish the
- * page with avc_policy_seqno() so detectors see the AOSP coherence contract
- * status.policyload == access.avd.seqno.
+ * selinux_status_update_policyload kretprobe: the primary trigger. Fires
+ * after every status-page policyload update. Real hot reloads write a
+ * positive policyload and the gate inside repair_status_policyload skips
+ * them; only KSU's update_policyload(0) reaches the writer path.
  */
 static int policyload_update_return_handler(struct kretprobe_instance *ri,
 					    struct pt_regs *regs)
 {
-	struct selinux_kernel_status_compat *status;
 	u32 avc_seqno;
 
 	if (!READ_ONCE(enabled))
@@ -290,15 +329,8 @@ static int policyload_update_return_handler(struct kretprobe_instance *ri,
 
 	bump_counter(&policyload_hook_hits);
 
-	if (!status_page_ready(&status))
-		return 0;
-
 	avc_seqno = read_avc_policy_seqno();
-	if (!avc_seqno)
-		return 0;
-
-	if (READ_ONCE(status->policyload) != avc_seqno)
-		repair_status_policyload(avc_seqno);
+	repair_status_policyload(avc_seqno);
 	return 0;
 }
 
@@ -346,12 +378,14 @@ static int __init selinux_seqno_fix_init(void)
 		return -EFAULT;
 	}
 
-	/* Seed the page once at load time so detectors that probe before any
-	 * kretprobe fires already see the AOSP coherence contract.
+	/*
+	 * Seed pass: only repairs if the page is currently in stomp state
+	 * (policyload == 0 with a positive avc_seqno). Pre-6.12 early-boot
+	 * state 0/0 has avc_seqno == 0 and is left alone; 6.12+ baseline
+	 * 4/1 has policyload != 0 and is also left alone.
 	 */
 	seed_seqno = read_avc_policy_seqno();
-	if (seed_seqno)
-		repair_status_policyload(seed_seqno);
+	repair_status_policyload(seed_seqno);
 
 	ret = register_kretprobe(&policyload_update_kretprobe);
 	if (ret) {
@@ -368,8 +402,9 @@ static int __init selinux_seqno_fix_init(void)
 		return ret;
 	}
 
-	pr_info("loaded; seed avc_seqno=%u status.policyload=%u\n",
-		seed_seqno, READ_ONCE(last_status_policyload));
+	pr_info("loaded; seed avc_seqno=%u status.policyload=%u (fixups=%lu passthrough=%lu)\n",
+		seed_seqno, READ_ONCE(last_status_policyload),
+		READ_ONCE(status_fixups), READ_ONCE(status_passthrough));
 	return 0;
 }
 
@@ -385,5 +420,5 @@ module_init(selinux_seqno_fix_init);
 module_exit(selinux_seqno_fix_exit);
 
 MODULE_AUTHOR("Andrea-Lyz, Codex");
-MODULE_DESCRIPTION("Restore SELinux status.policyload after KSU stomps it on policy load");
+MODULE_DESCRIPTION("Restore SELinux status.policyload after KSU stomps it on policy load (stomp-only gate, real hot reloads pass through)");
 MODULE_LICENSE("GPL");
